@@ -35,8 +35,7 @@ func BenchmarkPooled(b *testing.B) {
 			p.Submit(
 				ctx,
 				func(ctx context.Context) {
-					d := curve(ctx)
-					answer[i] = d
+					answer[i] = curve(ctx)
 				},
 			)
 		}
@@ -72,8 +71,7 @@ func BenchmarkPoolLimited(b *testing.B) {
 			p.Submit(
 				ctx,
 				func(ctx context.Context) {
-					d := curve(ctx)
-					answer[i] = d
+					answer[i] = curve(ctx)
 				},
 			)
 		}
@@ -108,8 +106,7 @@ func BenchmarkStandard(b *testing.B) {
 			func(ctx context.Context) {
 				defer func() { <-limiter }()
 				defer wg.Done()
-				d := curve(ctx)
-				answer[i] = d
+				answer[i] = curve(ctx)
 			}(ctx)
 		}
 		wg.Wait()
@@ -136,8 +133,7 @@ func BenchmarkTunny(b *testing.B) {
 		limit,
 		func(payload interface{}) interface{} {
 			i := payload.(int)
-			d := curve(ctx)
-			answer[i] = d
+			answer[i] = curve(ctx)
 			return nil
 		},
 	)

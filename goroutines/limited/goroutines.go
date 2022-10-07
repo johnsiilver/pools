@@ -79,6 +79,10 @@ func NonBlocking() goroutines.SubmitOption {
 
 // Submit submits the runner to be executed.
 func (p *Pool) Submit(ctx context.Context, runner goroutines.Job, options ...goroutines.SubmitOption) error {
+	if runner == nil {
+		return fmt.Errorf("cannot submit a runner that is nil")
+	}
+
 	opts := goroutines.SubmitOptions{Type: goroutines.PTLimited}
 
 	for _, o := range options {
@@ -90,10 +94,6 @@ func (p *Pool) Submit(ctx context.Context, runner goroutines.Job, options ...gor
 	if !opts.NonBlocking {
 		p.queue <- struct{}{}
 		defer func() { <-p.queue }()
-	}
-
-	if runner == nil {
-		return fmt.Errorf("cannot submit a runner that is nil")
 	}
 
 	p.wg.Add(1)

@@ -5,15 +5,15 @@ that you can retrieve buffers of a certain size.
 If the buffer capacity is changed before putting it back in the Pool, it will move
 to the next catagory of size.
 
-The Pool can have a static capcity of buffers or use a sync.Pool or both.
+The Pool can have a static capacity of buffers or use a sync.Pool or both.
 
 A Pool is created to support a BufferType, which can be a *bytes.Buffer, []byte or *[]byte.
-To avoid extra allocations, it is best to use *bytes.Buffer or *[]byte.
+To avoid extra allocations in sync.Pool, it is best to use *bytes.Buffer or *[]byte.
 
 Example:
 
 	pool, err := New[*[]byte](
-		[]Sizes{
+		Sizes{
 			{Size: 1, ConstBuff: 1000, SyncPool: true},
 			{Size: 2, ConstBuff: 1000, SyncPool: true},
 			{Size: 4, ConstBuff: 1000, SyncPool: true},
@@ -71,34 +71,40 @@ type Buffer[B BufferType] struct {
 // Close can be called when you are done with Buffer and want it to go back
 // into the Pool.
 func (b *Buffer[B]) Close() {
-	b.pool.Put(b)
+	if b.pool != nil {
+		b.pool.Put(b)
+	} else {
+		log.Println("bug: Buffer.Close() called that had no pool to return to")
+	}
 }
 
-// alloc allocates a new Buffer.Buffer of "size" and returns a new Buffer.
-// The original Buffer stays the same.
+// alloc allocates the Buffer.Buffer at "size".
 func (b *Buffer[B]) alloc(size int) {
 	switch any(b.Buffer).(type) {
 	case []byte:
 		buff := make([]byte, size)
 		ptr := unsafe.Pointer(&buff)
 		b.Buffer = *(*B)(ptr)
+		return
 	case *[]byte:
 		buff := make([]byte, size)
 		x := &buff
 		ptr := unsafe.Pointer(&x)
 		b.Buffer = *(*B)(ptr)
+		return
 	case *bytes.Buffer:
 		buff := make([]byte, size)
 		x := bytes.NewBuffer(buff)
 		ptr := unsafe.Pointer(&x)
 		b.Buffer = *(*B)(ptr)
+		return
 	}
-	panic(fmt.Sprintf("bug: unsupported type %T", b))
+	panic(fmt.Sprintf("bug: unsupported type %T", b.Buffer))
 }
 
 // cap returns the capacity of the Buffer.
 func (b *Buffer[B]) cap() int {
-	switch t := any(b).(type) {
+	switch t := any(b.Buffer).(type) {
 	case []byte:
 		return cap(t)
 	case *[]byte:
@@ -145,7 +151,8 @@ func (b *Buffer[B]) reset() int {
 	panic(fmt.Sprintf("bug: unsupported type %T", b))
 }
 
-// Pool holds a pool of []bytes
+// Pool holds a pool of *Buffer. Note: It is unsafe and unpredictable behavior to put
+// Buffers from one pool in another pool.
 type Pool[B BufferType] struct {
 	tree        *btree.BTreeG[storage]
 	largestSize int
@@ -154,7 +161,7 @@ type Pool[B BufferType] struct {
 // Sizes is a slice of Size arguments.
 type Sizes []Size
 
-// Size details a set of pool sizes that will be have their own buffer reuse space.
+// Size details a set of pool sizes that will have their own buffer reuse space.
 // This allows you to retrieve buffers that have a least the size you are looking for
 // to minimize allocations.
 type Size struct {
@@ -163,8 +170,17 @@ type Size struct {
 	// ConstBuff is how many buffer entries that are never collected
 	// should be in this pool.
 	ConstBuff int
-	// SyncPool indicates that the bool is backed by a sync.Pool.
+	// SyncPool indicates that the bool is backed by a sync.Pool when ConstBuff
+	// has no available buffers.
 	SyncPool bool
+	// DisallowAlloc indicates that if there are no allocation in the ConstBuff
+	// and SyncPool is false, a Get() should block until ConstBuff has an available
+	// buffer. If SyncPool is true, this will cause an error with New().
+	DisallowAlloc bool
+	// MaxSize will cause a buffer that is entering this pool
+	// that is larger than MaxSize to be thrown away. This prevents large buffers
+	// from being reusued when that is undesirable. This is ignored if <= 0.
+	MaxSize int
 }
 
 func (s Size) validate() error {
@@ -175,6 +191,17 @@ func (s Size) validate() error {
 	if s.ConstBuff <= 0 && !s.SyncPool {
 		return fmt.Errorf("cannot have a Size with ConstBuff not set and SyncPool off")
 	}
+
+	if s.DisallowAlloc && s.SyncPool {
+		return fmt.Errorf("cannot have DisallowAlloc and SyncPool both set to true")
+	}
+
+	if s.MaxSize > 0 {
+		if s.MaxSize <= s.Size {
+			return fmt.Errorf("cannot have MaxSize(%d) <= Size(%d", s.MaxSize, s.Size)
+		}
+	}
+
 	return nil
 }
 
@@ -182,10 +209,49 @@ type storage interface {
 	cap() int
 }
 
+// storageImpl implements storage.
 type storageImpl[B BufferType] struct {
+	// capSize is the capacity this is supposed to store. It may hold larger sizes.
 	capSize int
-	buff    chan *Buffer[B]
-	pool    *sync.Pool
+	// maxSize is the maximum size of a Buffer that can be stored in this.
+	maxSize int
+	// disallowAlloc indicates if we can allocate a new Buffer.
+	disallowAlloc bool
+	// buff is a static allocation of Buffers that won't go away once allocated.
+	buff chan *Buffer[B]
+	// pool is an overflow holding of Buffers.
+	pool *sync.Pool
+}
+
+// newStorageImpl creates a new storageImpl of size Size.
+func newStorageImpl[B BufferType](size Size) (*storageImpl[B], error) {
+	if err := size.validate(); err != nil {
+		return nil, err
+	}
+
+	si := &storageImpl[B]{capSize: size.Size, maxSize: size.MaxSize, disallowAlloc: size.DisallowAlloc}
+	if size.ConstBuff > 0 {
+		si.buff = make(chan *Buffer[B], size.ConstBuff)
+	}
+
+	if size.SyncPool {
+		si.pool = &sync.Pool{
+			New: func() any {
+				b := &Buffer[B]{belongsToPool: size.Size}
+				b.alloc(size.Size)
+				return b
+			},
+		}
+	} else {
+		// If we don't have a sync.Pool, we need to pre-allocate.
+		for i := 0; i < size.ConstBuff; i++ {
+			b := &Buffer[B]{}
+			b.alloc(size.Size)
+			si.buff <- b
+		}
+	}
+
+	return si, nil
 }
 
 func (s *storageImpl[B]) cap() int {
@@ -193,12 +259,27 @@ func (s *storageImpl[B]) cap() int {
 }
 
 func (s *storageImpl[B]) insert(b *Buffer[B]) {
+	if s.maxSize > 0 && b.cap() > s.maxSize {
+		return
+	}
+
+	if s.pool == nil {
+		b.fromSyncPool = false
+		b.belongsToPool = s.capSize
+		select {
+		case s.buff <- b:
+		default:
+			// This can happen when we are putting a resized buffers into
+			// a higher capacity pool and that pool is full.
+		}
+		return
+	}
+
+	// This is a duplicated from above out of necessity.
 	b.fromSyncPool = false
 	b.belongsToPool = s.capSize
-
 	select {
 	case s.buff <- b:
-		return
 	default:
 	}
 	b.fromSyncPool = true
@@ -206,11 +287,17 @@ func (s *storageImpl[B]) insert(b *Buffer[B]) {
 }
 
 func (s *storageImpl[B]) get() *Buffer[B] {
+	if s.disallowAlloc {
+		return <-s.buff
+	}
+
+	// Try from our constant buffer first.
 	select {
 	case x := <-s.buff:
 		return x
 	default:
 	}
+	// If we have a pool, pull from the pool
 	if s.pool != nil {
 		return s.pool.Get().(*Buffer[B])
 	}
@@ -242,27 +329,16 @@ func New[B BufferType](sizes Sizes) (*Pool[B], error) {
 
 	largestSize := 0
 	for _, size := range sizes {
-		if err := size.validate(); err != nil {
-			return nil, err
-		}
 		if size.Size > largestSize {
 			largestSize = size.Size
 		}
-		si := &storageImpl[B]{capSize: size.Size}
-		if size.ConstBuff > 0 {
-			si.buff = make(chan *Buffer[B], size.ConstBuff)
+		si, err := newStorageImpl[B](size)
+		if err != nil {
+			return nil, err
 		}
-
-		if size.SyncPool {
-			si.pool = &sync.Pool{
-				New: func() any {
-					b := &Buffer[B]{belongsToPool: size.Size}
-					b.alloc(size.Size)
-					return b
-				},
-			}
+		if _, ok := tree.ReplaceOrInsert(si); ok {
+			return nil, fmt.Errorf("cannot have two pools of size %d", si.capSize)
 		}
-		tree.ReplaceOrInsert(si)
 	}
 	return &Pool[B]{tree: tree, largestSize: largestSize}, nil
 }
@@ -282,7 +358,7 @@ func (p *Pool[B]) Get(atLeast int) *Buffer[B] {
 		iter,
 	)
 
-	if store != nil {
+	if store != nil && store.capSize >= atLeast {
 		b := store.get()
 		b.pool = p
 		return b
@@ -290,6 +366,10 @@ func (p *Pool[B]) Get(atLeast int) *Buffer[B] {
 
 	item, _ := p.tree.Max()
 	store = item.(*storageImpl[B])
+
+	// We allocate a new Buffer because this is larger than any of our storage.
+	// We associate the Buffer with the largest storage, however it may not end
+	// up there depending on the MaxSize setting for that pool.
 	b := &Buffer[B]{}
 	b.alloc(atLeast)
 	b.belongsToPool = store.capSize
@@ -307,14 +387,7 @@ func (p *Pool[B]) Put(b *Buffer[B]) {
 		item, ok := p.tree.Get(find(size))
 		if ok {
 			store := item.(*storageImpl[B])
-			b.fromSyncPool = false
-			select {
-			case store.buff <- b:
-				return
-			default:
-			}
-			b.fromSyncPool = true
-			store.pool.Put(b)
+			store.insert(b)
 			return
 		}
 		log.Printf("bug: should have been able to find tree entry(%d), but didn't", size)
@@ -356,4 +429,32 @@ func (p *Pool[B]) Put(b *Buffer[B]) {
 	)
 	b.belongsToPool = store.capSize
 	store.insert(b)
+}
+
+func (p *Pool[B]) put(store *storageImpl[B], b *Buffer[B]) {
+
+	if store.capSize == b.cap() {
+		store.insert(b)
+		return
+	}
+
+	// We might need to put something back in the static buffer from the old storage.
+	if !b.fromSyncPool {
+		// Find the old storage.
+		item, ok := p.tree.Get(find(b.belongsToPool))
+		if ok {
+			prevStore := item.(*storageImpl[B])
+
+			// Onlyl need to do this if it doesn't have a pool and isn't full.
+			if prevStore.pool == nil && len(prevStore.buff) < cap(prevStore.buff) {
+				n := &Buffer[B]{belongsToPool: b.belongsToPool, pool: p}
+				n.alloc(b.belongsToPool)
+				prevStore.insert(n)
+				return
+			}
+		} else {
+			log.Printf("could not find pool(size %d) that a buffer supposedly belonged to", b.belongsToPool)
+		}
+	}
+
 }

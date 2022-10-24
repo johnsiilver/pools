@@ -35,7 +35,7 @@ Example:
 	...
 	...
 
-	b.Close() // Puts it back in the pool, you can also do pool.Put(b)
+	b.Close() // Puts the buffer back in the pool.
 */
 package diffsize
 
@@ -72,7 +72,7 @@ type Buffer[B BufferType] struct {
 // into the Pool.
 func (b *Buffer[B]) Close() {
 	if b.pool != nil {
-		b.pool.Put(b)
+		b.pool.put(b)
 	} else {
 		log.Println("bug: Buffer.Close() called that had no pool to return to")
 	}
@@ -116,17 +116,16 @@ func (b *Buffer[B]) cap() int {
 }
 
 func (b *Buffer[B]) reset() int {
-	size := 0
 	switch t := any(b.Buffer).(type) {
 	case []byte:
 		if cap(t) == 0 {
-			return size
+			return 0
 		}
 		if cap(t) == len(t) {
 			return len(t)
 		}
 		if len(t) != cap(t) {
-			t = t[:cap(t)] // I'm sure this is wrong, fix when internet is back.
+			t = t[:cap(t)]
 		}
 
 		ptr := unsafe.Pointer(&t)
@@ -134,7 +133,7 @@ func (b *Buffer[B]) reset() int {
 		return cap(t)
 	case *[]byte:
 		if cap(*t) == 0 {
-			return size
+			return 0
 		}
 		if cap(*t) == len(*t) {
 			return len(*t)
@@ -197,7 +196,7 @@ func (s Size) validate() error {
 	}
 
 	if s.MaxSize > 0 {
-		if s.MaxSize <= s.Size {
+		if s.MaxSize < s.Size {
 			return fmt.Errorf("cannot have MaxSize(%d) <= Size(%d", s.MaxSize, s.Size)
 		}
 	}
@@ -343,8 +342,41 @@ func New[B BufferType](sizes Sizes) (*Pool[B], error) {
 	return &Pool[B]{tree: tree, largestSize: largestSize}, nil
 }
 
-// Get returns a Buffer from the pool.
+// Get returns a Buffer from the pool that is at least "atLeast" in capacity.
+// If the type is []byte or *[]byte it's size will be set to its capacity (which may be
+// bigger than you requested). If it is a *bytes.Buffer, it will have had .Reset() called
+// on it. If this size is larger than the biggest pool storage, then a new Buffer
+// will be returned that meets the size requirement. When DisallowAlloc is set,
+// this condition bypasses that in order to prevent a condition where we cannot
+// allocate what is requested. This will cause a log message.
 func (p *Pool[B]) Get(atLeast int) *Buffer[B] {
+	var store = p.getStore(atLeast)
+
+	if store != nil && store.capSize >= atLeast {
+		b := store.get()
+		b.belongsToPool = store.capSize
+		b.pool = p
+		return b
+	}
+
+	item, _ := p.tree.Max()
+	store = item.(*storageImpl[B])
+
+	// We allocate a new Buffer because this is larger than any of our storage.
+	// We associate the Buffer with the largest storage, however it may not end
+	// up there depending on the MaxSize setting for that pool.
+	b := &Buffer[B]{}
+	b.alloc(atLeast)
+	if !store.disallowAlloc {
+		b.belongsToPool = store.capSize
+		b.pool = p
+	} else {
+		log.Printf("diffsize.Pool.Get(%d): exceeds pool storage sizes and largest store has disallowAlloc set, your code is bugged", atLeast)
+	}
+	return b
+}
+
+func (p *Pool[B]) getStore(atLeast int) *storageImpl[B] {
 	var store *storageImpl[B]
 
 	var iter btree.ItemIteratorG[storage] = func(item storage) bool {
@@ -358,39 +390,23 @@ func (p *Pool[B]) Get(atLeast int) *Buffer[B] {
 		iter,
 	)
 
-	if store != nil && store.capSize >= atLeast {
-		b := store.get()
-		b.pool = p
-		return b
-	}
-
-	item, _ := p.tree.Max()
-	store = item.(*storageImpl[B])
-
-	// We allocate a new Buffer because this is larger than any of our storage.
-	// We associate the Buffer with the largest storage, however it may not end
-	// up there depending on the MaxSize setting for that pool.
-	b := &Buffer[B]{}
-	b.alloc(atLeast)
-	b.belongsToPool = store.capSize
-	b.pool = p
-	return b
+	return store
 }
 
 // Put puts a Buffer into the pool.
-func (p *Pool[B]) Put(b *Buffer[B]) {
+func (p *Pool[B]) put(b *Buffer[B]) {
 	size := b.reset()
 
 	// The buffer didn't change size, so it can go back to the same place it
 	// started at.
-	if size == b.belongsToPool {
+	if b.reset() == b.belongsToPool {
 		item, ok := p.tree.Get(find(size))
 		if ok {
 			store := item.(*storageImpl[B])
 			store.insert(b)
 			return
 		}
-		log.Printf("bug: should have been able to find tree entry(%d), but didn't", size)
+		log.Printf("bug: should have been able to find tree entry(%d), but didn't", b.reset())
 	}
 
 	// Okay, this exceeds our largest buffer size, put it in whatever is our
@@ -429,32 +445,4 @@ func (p *Pool[B]) Put(b *Buffer[B]) {
 	)
 	b.belongsToPool = store.capSize
 	store.insert(b)
-}
-
-func (p *Pool[B]) put(store *storageImpl[B], b *Buffer[B]) {
-
-	if store.capSize == b.cap() {
-		store.insert(b)
-		return
-	}
-
-	// We might need to put something back in the static buffer from the old storage.
-	if !b.fromSyncPool {
-		// Find the old storage.
-		item, ok := p.tree.Get(find(b.belongsToPool))
-		if ok {
-			prevStore := item.(*storageImpl[B])
-
-			// Onlyl need to do this if it doesn't have a pool and isn't full.
-			if prevStore.pool == nil && len(prevStore.buff) < cap(prevStore.buff) {
-				n := &Buffer[B]{belongsToPool: b.belongsToPool, pool: p}
-				n.alloc(b.belongsToPool)
-				prevStore.insert(n)
-				return
-			}
-		} else {
-			log.Printf("could not find pool(size %d) that a buffer supposedly belonged to", b.belongsToPool)
-		}
-	}
-
 }

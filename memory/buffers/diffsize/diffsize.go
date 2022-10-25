@@ -43,10 +43,9 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"unsafe"
-
-	"github.com/google/btree"
 )
 
 // BufferType details the types of buffers that are available to use.
@@ -153,12 +152,23 @@ func (b *Buffer[B]) reset() int {
 // Pool holds a pool of *Buffer. Note: It is unsafe and unpredictable behavior to put
 // Buffers from one pool in another pool.
 type Pool[B BufferType] struct {
-	tree        *btree.BTreeG[storage]
+	stores      []*storageImpl[B]
 	largestSize int
 }
 
 // Sizes is a slice of Size arguments.
 type Sizes []Size
+
+func (s Sizes) validate() error {
+	seen := map[int]bool{}
+	for _, size := range s {
+		if seen[size.Size] {
+			return fmt.Errorf("Size(%d) was defined more than once", size.Size)
+		}
+		seen[size.Size] = true
+	}
+	return nil
+}
 
 // Size details a set of pool sizes that will have their own buffer reuse space.
 // This allows you to retrieve buffers that have a least the size you are looking for
@@ -202,10 +212,6 @@ func (s Size) validate() error {
 	}
 
 	return nil
-}
-
-type storage interface {
-	cap() int
 }
 
 // storageImpl implements storage.
@@ -308,23 +314,16 @@ func (s *storageImpl[B]) get() *Buffer[B] {
 	return b
 }
 
-type find int
-
-func (f find) cap() int {
-	return int(f)
-}
-
-func lessFunc[S storage](a, b S) bool {
-	return a.cap() < b.cap()
-}
-
 // New creates a new Pool.
 func New[B BufferType](sizes Sizes) (*Pool[B], error) {
 	if len(sizes) == 0 {
 		return nil, fmt.Errorf("must specify sizes")
 	}
+	if err := sizes.validate(); err != nil {
+		return nil, err
+	}
 
-	tree := btree.NewG(2, lessFunc[storage])
+	pool := &Pool[B]{}
 
 	largestSize := 0
 	for _, size := range sizes {
@@ -335,11 +334,12 @@ func New[B BufferType](sizes Sizes) (*Pool[B], error) {
 		if err != nil {
 			return nil, err
 		}
-		if _, ok := tree.ReplaceOrInsert(si); ok {
-			return nil, fmt.Errorf("cannot have two pools of size %d", si.capSize)
-		}
+		pool.stores = append(pool.stores, si)
 	}
-	return &Pool[B]{tree: tree, largestSize: largestSize}, nil
+	pool.largestSize = largestSize
+	sortStorageImpl(pool.stores)
+
+	return pool, nil
 }
 
 // Get returns a Buffer from the pool that is at least "atLeast" in capacity.
@@ -350,7 +350,7 @@ func New[B BufferType](sizes Sizes) (*Pool[B], error) {
 // this condition bypasses that in order to prevent a condition where we cannot
 // allocate what is requested. This will cause a log message.
 func (p *Pool[B]) Get(atLeast int) *Buffer[B] {
-	var store = p.getStore(atLeast)
+	store := p.getStore(atLeast) // ALLOC
 
 	if store != nil && store.capSize >= atLeast {
 		b := store.get()
@@ -359,8 +359,7 @@ func (p *Pool[B]) Get(atLeast int) *Buffer[B] {
 		return b
 	}
 
-	item, _ := p.tree.Max()
-	store = item.(*storageImpl[B])
+	store = p.findStore(p.largestSize)
 
 	// We allocate a new Buffer because this is larger than any of our storage.
 	// We associate the Buffer with the largest storage, however it may not end
@@ -377,20 +376,35 @@ func (p *Pool[B]) Get(atLeast int) *Buffer[B] {
 }
 
 func (p *Pool[B]) getStore(atLeast int) *storageImpl[B] {
-	var store *storageImpl[B]
-
-	var iter btree.ItemIteratorG[storage] = func(item storage) bool {
-		a := item.(*storageImpl[B])
-		store = a
-		return false
+	if atLeast > p.largestSize {
+		return nil
 	}
+	l := len(p.stores)
 
-	p.tree.AscendGreaterOrEqual(
-		find(atLeast),
-		iter,
+	i := sort.Search(
+		l,
+		func(i int) bool {
+			return p.stores[i].capSize >= atLeast
+		},
 	)
+	if i == l {
+		return nil
+	}
+	return p.stores[i]
+}
 
-	return store
+func (p *Pool[B]) findStore(size int) *storageImpl[B] {
+	l := len(p.stores)
+	i := sort.Search(
+		l,
+		func(i int) bool {
+			return p.stores[i].capSize >= size
+		},
+	)
+	if i == l || p.stores[i].capSize != size {
+		return nil
+	}
+	return p.stores[i]
 }
 
 // Put puts a Buffer into the pool.
@@ -400,9 +414,8 @@ func (p *Pool[B]) put(b *Buffer[B]) {
 	// The buffer didn't change size, so it can go back to the same place it
 	// started at.
 	if b.reset() == b.belongsToPool {
-		item, ok := p.tree.Get(find(size))
-		if ok {
-			store := item.(*storageImpl[B])
+		store := p.findStore(size)
+		if store != nil {
 			store.insert(b)
 			return
 		}
@@ -412,37 +425,24 @@ func (p *Pool[B]) put(b *Buffer[B]) {
 	// Okay, this exceeds our largest buffer size, put it in whatever is our
 	// largest storage buffer.
 	if size >= p.largestSize {
-		item, ok := p.tree.Get(find(p.largestSize))
-		if !ok {
-			panic(fmt.Sprintf("something is terribly wrong here: can't find largest size(%d) tree entry", p.largestSize))
-		}
-
-		store := item.(*storageImpl[B])
+		store := p.findStore(p.largestSize)
 		b.belongsToPool = store.capSize
 		store.insert(b)
 		return
 	}
 
 	// Okay, this goes in some mid tier storage. Find it and store it there.
-	item, ok := p.tree.Get(find(b.belongsToPool))
-	if !ok {
+	store := p.findStore(b.belongsToPool)
+	if store == nil {
 		panic(fmt.Sprintf("something is terribly wrong here: can't find largest size(%d) tree entry", p.largestSize))
 	}
-	store := item.(*storageImpl[B])
 
-	var iter btree.ItemIteratorG[storage] = func(item storage) bool {
-		a := item.(*storageImpl[B])
-		if a.capSize > size {
-			return false
-		}
-		store = a
-		return true
-	}
-
-	p.tree.AscendGreaterOrEqual(
-		find(size),
-		iter,
-	)
 	b.belongsToPool = store.capSize
 	store.insert(b)
+}
+
+func sortStorageImpl[B BufferType](s []*storageImpl[B]) {
+	sort.Slice(s, func(i, j int) bool {
+		return s[i].capSize < s[j].capSize
+	})
 }

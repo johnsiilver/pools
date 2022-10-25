@@ -387,16 +387,65 @@ func TestPoolGetStore(t *testing.T) {
 		s := p.getStore(test.atLeast)
 		if s == nil {
 			if test.want != 0 {
-				t.Errorf("TestGetStore(%s): got store == nil, want %d", test.desc, test.want)
+				t.Errorf("TestPoolGetStore(%s): got store == nil, want %d", test.desc, test.want)
 			}
 			continue
 		}
 
 		if s.capSize != test.want {
-			t.Errorf("TestGetStore(%s): getStore(%d): got capacity %d, want capacity %d", test.desc, test.atLeast, s.capSize, test.want)
+			t.Errorf("TestPoolGetStore(%s): getStore(%d): got capacity %d, want capacity %d", test.desc, test.atLeast, s.capSize, test.want)
 		}
 	}
+}
 
+func TestPoolFindStore(t *testing.T) {
+	p, err := New[[]byte](
+		Sizes{
+			Size{Size: 8, ConstBuff: 1},
+			Size{Size: 16, ConstBuff: 1},
+			Size{Size: 32, ConstBuff: 1},
+		},
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	tests := []struct {
+		desc string
+		find int
+		want int
+	}{
+		{
+			find: 8,
+			want: 8,
+		},
+		{
+			find: 16,
+			want: 16,
+		},
+		{
+			find: 32,
+			want: 32,
+		},
+		{
+			find: 17,
+			want: 0,
+		},
+	}
+
+	for _, test := range tests {
+		s := p.findStore(test.find)
+		if s == nil {
+			if test.want != 0 {
+				t.Errorf("TestPoolFindStore(%s): got store == nil, want %d", test.desc, test.want)
+			}
+			continue
+		}
+
+		if s.capSize != test.want {
+			t.Errorf("TestPoolFindStore(%s): findStore(%d): got capacity %d, want capacity %d", test.desc, test.find, s.capSize, test.want)
+		}
+	}
 }
 
 func TestPool(t *testing.T) {

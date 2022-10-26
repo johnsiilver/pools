@@ -152,7 +152,7 @@ func (b *Buffer[B]) reset() int {
 // Pool holds a pool of *Buffer. Note: It is unsafe and unpredictable behavior to put
 // Buffers from one pool in another pool.
 type Pool[B BufferType] struct {
-	stores      []*storageImpl[B]
+	stores      []*storage[B]
 	largestSize int
 }
 
@@ -214,8 +214,8 @@ func (s Size) validate() error {
 	return nil
 }
 
-// storageImpl implements storage.
-type storageImpl[B BufferType] struct {
+// storage implements storage.
+type storage[B BufferType] struct {
 	// capSize is the capacity this is supposed to store. It may hold larger sizes.
 	capSize int
 	// maxSize is the maximum size of a Buffer that can be stored in this.
@@ -228,13 +228,13 @@ type storageImpl[B BufferType] struct {
 	pool *sync.Pool
 }
 
-// newStorageImpl creates a new storageImpl of size Size.
-func newStorageImpl[B BufferType](size Size) (*storageImpl[B], error) {
+// newStorage creates a new storage of size Size.
+func newStorage[B BufferType](size Size) (*storage[B], error) {
 	if err := size.validate(); err != nil {
 		return nil, err
 	}
 
-	si := &storageImpl[B]{capSize: size.Size, maxSize: size.MaxSize, disallowAlloc: size.DisallowAlloc}
+	si := &storage[B]{capSize: size.Size, maxSize: size.MaxSize, disallowAlloc: size.DisallowAlloc}
 	if size.ConstBuff > 0 {
 		si.buff = make(chan *Buffer[B], size.ConstBuff)
 	}
@@ -259,39 +259,31 @@ func newStorageImpl[B BufferType](size Size) (*storageImpl[B], error) {
 	return si, nil
 }
 
-func (s *storageImpl[B]) cap() int {
+func (s *storage[B]) cap() int {
 	return s.capSize
 }
 
-func (s *storageImpl[B]) insert(b *Buffer[B]) {
+func (s *storage[B]) insert(b *Buffer[B]) {
 	if s.maxSize > 0 && b.cap() > s.maxSize {
 		return
 	}
 
-	if s.pool == nil {
-		b.fromSyncPool = false
-		b.belongsToPool = s.capSize
-		select {
-		case s.buff <- b:
-		default:
-			// This can happen when we are putting a resized buffers into
-			// a higher capacity pool and that pool is full.
-		}
-		return
-	}
-
-	// This is a duplicated from above out of necessity.
 	b.fromSyncPool = false
 	b.belongsToPool = s.capSize
 	select {
 	case s.buff <- b:
 	default:
+		// This can happen when we are putting a resized buffers into
+		// a higher capacity pool and that pool is full.
+	}
+	if s.pool == nil {
+		return
 	}
 	b.fromSyncPool = true
 	s.pool.Put(b)
 }
 
-func (s *storageImpl[B]) get() *Buffer[B] {
+func (s *storage[B]) get() *Buffer[B] {
 	if s.disallowAlloc {
 		return <-s.buff
 	}
@@ -330,7 +322,7 @@ func New[B BufferType](sizes Sizes) (*Pool[B], error) {
 		if size.Size > largestSize {
 			largestSize = size.Size
 		}
-		si, err := newStorageImpl[B](size)
+		si, err := newStorage[B](size)
 		if err != nil {
 			return nil, err
 		}
@@ -347,10 +339,10 @@ func New[B BufferType](sizes Sizes) (*Pool[B], error) {
 // bigger than you requested). If it is a *bytes.Buffer, it will have had .Reset() called
 // on it. If this size is larger than the biggest pool storage, then a new Buffer
 // will be returned that meets the size requirement. When DisallowAlloc is set,
-// this condition bypasses that in order to prevent a condition where we cannot
+// this condition bypasses that in order to prevent a issue where we cannot
 // allocate what is requested. This will cause a log message.
 func (p *Pool[B]) Get(atLeast int) *Buffer[B] {
-	store := p.getStore(atLeast) // ALLOC
+	store := p.getStore(atLeast)
 
 	if store != nil && store.capSize >= atLeast {
 		b := store.get()
@@ -361,7 +353,7 @@ func (p *Pool[B]) Get(atLeast int) *Buffer[B] {
 
 	store = p.findStore(p.largestSize)
 
-	// We allocate a new Buffer because this is larger than any of our storage.
+	// We allocate a new Buffer because that is larger than any of our storage.
 	// We associate the Buffer with the largest storage, however it may not end
 	// up there depending on the MaxSize setting for that pool.
 	b := &Buffer[B]{}
@@ -375,7 +367,7 @@ func (p *Pool[B]) Get(atLeast int) *Buffer[B] {
 	return b
 }
 
-func (p *Pool[B]) getStore(atLeast int) *storageImpl[B] {
+func (p *Pool[B]) getStore(atLeast int) *storage[B] {
 	if atLeast > p.largestSize {
 		return nil
 	}
@@ -393,7 +385,7 @@ func (p *Pool[B]) getStore(atLeast int) *storageImpl[B] {
 	return p.stores[i]
 }
 
-func (p *Pool[B]) findStore(size int) *storageImpl[B] {
+func (p *Pool[B]) findStore(size int) *storage[B] {
 	l := len(p.stores)
 	i := sort.Search(
 		l,
@@ -441,7 +433,7 @@ func (p *Pool[B]) put(b *Buffer[B]) {
 	store.insert(b)
 }
 
-func sortStorageImpl[B BufferType](s []*storageImpl[B]) {
+func sortStorageImpl[B BufferType](s []*storage[B]) {
 	sort.Slice(s, func(i, j int) bool {
 		return s[i].capSize < s[j].capSize
 	})

@@ -241,7 +241,7 @@ func TestStorageImplCapSize(t *testing.T) {
 	t.Parallel()
 
 	const size = 8
-	s, err := newStorageImpl[[]byte](Size{Size: size, ConstBuff: 1})
+	s, err := newStorage[[]byte](Size{Size: size, ConstBuff: 1})
 	if err != nil {
 		panic(err)
 	}

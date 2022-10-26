@@ -6,12 +6,7 @@ As Go has matured, goroutines have become more efficient. This type of pool star
 very fast and is only slightly slower than our pooled version.  For pools that you
 want to start up and tear down quickly, this might be the best choice.
 
-Example:
-
-	pool := New(10)
-	defer pool.Close()
-
-	pool.Submit(func(ctx context.Context){ fmt.Println("hello world")})
+See the examples in the parent package "goroutines" for an overview of using pools.
 */
 package limited
 
@@ -22,6 +17,7 @@ import (
 	"sync/atomic"
 
 	"github.com/johnsiilver/pools/goroutines"
+	"github.com/johnsiilver/pools/goroutines/internal/pool"
 )
 
 var _ goroutines.Pool = &Pool{}
@@ -68,8 +64,8 @@ func (p *Pool) Running() int {
 // and it is not counted against the total. This is useful when you want to track
 // the statistics still but need this goroutine to run and don't want to do it naked.
 func NonBlocking() goroutines.SubmitOption {
-	return func(opt *goroutines.SubmitOptions) error {
-		if opt.Type != goroutines.PTLimited {
+	return func(opt *pool.SubmitOptions) error {
+		if opt.Type != pool.PTLimited {
 			return fmt.Errorf("cannot use limited.NotBlocking() with a non limited.Pool")
 		}
 		opt.NonBlocking = true
@@ -83,7 +79,7 @@ func (p *Pool) Submit(ctx context.Context, runner goroutines.Job, options ...gor
 		return fmt.Errorf("cannot submit a runner that is nil")
 	}
 
-	opts := goroutines.SubmitOptions{Type: goroutines.PTLimited}
+	opts := pool.SubmitOptions{Type: pool.PTLimited}
 
 	for _, o := range options {
 		if err := o(&opts); err != nil {

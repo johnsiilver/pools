@@ -2,7 +2,7 @@
 
 ## Introduction
 
-The packages contained in here provide basic pooling for goroutines. These pools provide the ability to gather statistics, limit the number of goroutines in use and allow reuse of goroutines to lower allocations.
+The packages contained here provide basic pooling for goroutines. These pools provide the ability to gather statistics, limit the number of goroutines in use and allow reuse of goroutines to lower allocations.
 
 These pools are designed to avoid `any` and `sync.Mutex` to prioritize speed. 
 

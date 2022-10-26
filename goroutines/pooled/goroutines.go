@@ -2,12 +2,7 @@
 Package goroutiones provides a Pool of goroutines where you can submit Jobs
 to be run when by an exisiting goroutine instead of spinning off a new goroutine.
 
-Example:
-
-	pool := New(10)
-	defer pool.Close()
-
-	pool.Submit(func(ctx context.Context){ fmt.Println("hello world")})
+See the examples in the parent package "goroutines" for an overview of using pools.
 */
 package pooled
 
@@ -18,6 +13,7 @@ import (
 	"sync/atomic"
 
 	"github.com/johnsiilver/pools/goroutines"
+	"github.com/johnsiilver/pools/goroutines/internal/pool"
 )
 
 var _ goroutines.Pool = &Pool{}
@@ -73,10 +69,10 @@ type submit struct {
 }
 
 // NonBlocking indicates that if a pooled goroutine is not available, spin off
-// a goroutine and do not block..
+// a goroutine and do not block.
 func NonBlocking() goroutines.SubmitOption {
-	return func(opt *goroutines.SubmitOptions) error {
-		if opt.Type != goroutines.PTPooled {
+	return func(opt *pool.SubmitOptions) error {
+		if opt.Type != pool.PTPooled {
 			return fmt.Errorf("cannot use pooled.NotBlocking() with a non pooled.Pool")
 		}
 		opt.NonBlocking = true
@@ -90,7 +86,7 @@ func (p *Pool) Submit(ctx context.Context, runner goroutines.Job, options ...gor
 		return fmt.Errorf("cannot submit a runner that is nil")
 	}
 
-	opts := goroutines.SubmitOptions{Type: goroutines.PTLimited}
+	opts := pool.SubmitOptions{Type: pool.PTPooled}
 
 	for _, o := range options {
 		if err := o(&opts); err != nil {

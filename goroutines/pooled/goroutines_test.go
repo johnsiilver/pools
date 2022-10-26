@@ -36,7 +36,10 @@ func TestNonBlocking(t *testing.T) {
 	p := &Pool{}
 	worked := false
 
-	p.Submit(ctx, func(ctx context.Context) { worked = true }, NonBlocking())
+	err := p.Submit(ctx, func(ctx context.Context) { worked = true }, NonBlocking())
+	if err != nil {
+		panic(err)
+	}
 
 	p.Wait()
 

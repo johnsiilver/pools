@@ -3,7 +3,7 @@ Package diffsize provides a pool that holds different sizes of buffer space so
 that you can retrieve buffers of a certain size.
 
 If the buffer capacity is changed before putting it back in the Pool, it will move
-to the next catagory of size.
+to the next category of size.
 
 The Pool can have a static capacity of buffers or use a sync.Pool or both.
 

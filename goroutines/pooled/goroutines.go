@@ -115,7 +115,7 @@ func (p *Pool) Submit(ctx context.Context, runner goroutines.Job, options ...gor
 	return nil
 }
 
-// runner is used to run any funciton taht comes in on the in channel.
+// runner is used to run any function that comes in on the in channel.
 func (p *Pool) runner() {
 	for s := range p.queue {
 		s.job(s.ctx)

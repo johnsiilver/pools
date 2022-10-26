@@ -1,7 +1,7 @@
 # Pools Goroutines
 
 [![GoDoc](https://godoc.org/github.com/johnsiilver/pools/goroutines?status.svg)](https://pkg.go.dev/github.com/johnsiilver/pools/goroutines)
-[![Go Report Card](https://goreportcard.com/badge/github.com/johnsiilver/pools/goroutines)](https://goreportcard.com/report/github.com/johnsiilver/pools/goroutines)
+[![Go Report Card](https://goreportcard.com/badge/github.com/johnsiilver/pools)](https://goreportcard.com/report/github.com/johnsiilver/pools)
 
 ## Introduction
 

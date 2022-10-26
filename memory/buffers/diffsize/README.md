@@ -1,5 +1,8 @@
 # Diffsize Buffer Pooling
 
+[![GoDoc](https://godoc.org/github.com/johnsiilver/pools/memory/buffers/diffsize?status.svg)](https://pkg.go.dev/github.com/johnsiilver/pools/memory/buffers/diffsize)
+[![Go Report Card](https://goreportcard.com/badge/github.com/johnsiilver/pools/memory/buffers/diffsize)](https://goreportcard.com/report/github.com/johnsiilver/pools/memory/buffers/diffsize)
+
 ## Introduction
 
 This package provides a multi-size buffer cache and sync.Pool to reduce overhead for the `*bytes.Buffer`, `*[]byte` and `[]byte` types.

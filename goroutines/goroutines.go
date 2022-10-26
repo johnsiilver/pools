@@ -39,7 +39,7 @@ Example of using a pool where errors occur, but shouldn't stop execution:
 	}
 	defer p.Close()
 
-	e := Errors{}
+	e := goroutines.Errors{}
 	ch := make(chan *client.Response, runtime.NumCPU())
 
 	// urls would just be some []string containing URLs.
@@ -90,6 +90,9 @@ Example of using a pool where errors occur and should stop exeuction:
 		panic(err)
 	}
 	defer p.Close()
+
+	e := goroutines.Errors{}
+	ch := make(chan *client.Response, runtime.NumCPU())
 
 	// urls would just be some []string containing URLs.
 	for _, url := range urls {

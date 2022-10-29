@@ -63,8 +63,7 @@ Introducing `PoolBuffer` which allows you to use the same underlying buffer `Poo
 
 Benchmarks are between `PoolBuffer` and `bytes.Buffer` are borrowed from the standard library (and `PoolBuffer` is almost identical in code).  These are pretty simplistic benchmarks.
 
-In all cases where Benchmarks for `bytes.Buffer` win, it is usually because the asked for buffer was larger than are our largest buffer or an allocation was made in a `sync.Pool` for storage. In longer term runs I'd expect the average case to always beat `bytes.Buffer` unless your `Sizes` provided to the pool where way off.
-
+In all cases where Benchmarks for `bytes.Buffer` win, it is usually because the asked for buffer was larger than are our largest buffer and an allocation was made in a `sync.Pool` for storage or the test didn't amoritize the cost of Pooling with multiple pulls of similar size. In longer term runs I'd expect the average case to always beat `bytes.Buffer` unless your `Sizes` provided to the pool were way off.
 ```
 PoolBuffer
 BenchmarkReadString-10                            238203              5103 ns/op        6421.08 MB/s       65706 B/op          5 allocs/op

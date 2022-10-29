@@ -362,7 +362,7 @@ func (p *Pool[B]) Get(atLeast int) *Buffer[B] {
 		b.belongsToPool = store.capSize
 		b.pool = p
 	} else {
-		log.Printf("diffsize.Pool.Get(%d): exceeds pool storage sizes and largest store has disallowAlloc set, your code is bugged", atLeast)
+		log.Printf("diffsize.Pool.Get: exceeds pool storage sizes and largest store has disallowAlloc set, your code is bugged")
 	}
 	return b
 }
@@ -411,7 +411,7 @@ func (p *Pool[B]) put(b *Buffer[B]) {
 			store.insert(b)
 			return
 		}
-		log.Printf("bug: should have been able to find tree entry(%d), but didn't", b.reset())
+		log.Printf("bug: should have been able to find tree entry, but didn't")
 	}
 
 	// Okay, this exceeds our largest buffer size, put it in whatever is our
@@ -426,7 +426,7 @@ func (p *Pool[B]) put(b *Buffer[B]) {
 	// Okay, this goes in some mid tier storage. Find it and store it there.
 	store := p.findStore(b.belongsToPool)
 	if store == nil {
-		panic(fmt.Sprintf("something is terribly wrong here: can't find largest size(%d) tree entry", p.largestSize))
+		panic("something is terribly wrong here: can't find largest size tree entry")
 	}
 
 	b.belongsToPool = store.capSize

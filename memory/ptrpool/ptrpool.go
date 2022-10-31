@@ -14,7 +14,7 @@ Here are some examples of different Pool configurations:
 Example: Freelist only
 
 	pool, err := New[Record](
-		static 100,
+		100,
 		func() *Record {
 			return &Record{}
 		},
@@ -48,10 +48,10 @@ Example: Freelist only
 		v.Close()
 	}
 
-Example: Freelist with maximum allocations set to freelist size
+Example: Freelist with no allocations beyond freelist
 
 	pool, err := New[Record](
-		static 100,
+		100,
 		func() *Record {
 			return &Record{}
 		},
@@ -73,7 +73,7 @@ Example: Freelist with maximum allocations set to freelist size
 Example: Freelist with sync.Pool for backup
 
 	pool, err := New[Record](
-		static 10,
+		10,
 		func() *Record {
 			return &Record{}
 		},
@@ -176,6 +176,14 @@ func New[A any](freelist int, newer NewValue[A], options ...Option[A]) (*Pool[A]
 		allocs: true,
 		stats:  &stats{},
 	}
+
+	syncNewWrap := func() any {
+		v := newer()
+		p.stats.NewAlloc.Add(1)
+		p.stats.SyncPoolMiss.Add(1)
+		return v
+	}
+	p.pool.New = syncNewWrap
 
 	if freelist > 0 {
 		staticBuff := make(chan *A, freelist)
@@ -285,7 +293,7 @@ func (p *Pool[A]) Stats() Stats {
 type stats struct {
 	InUse atomic.Int64
 
-	FreelListAllocated, SyncPoolAllocated,
+	FreelListAllocated, SyncPoolAllocated, SyncPoolMiss,
 	NewAlloc, TotalAllocated atomic.Uint64
 }
 
@@ -295,6 +303,7 @@ func (s *stats) toStats() Stats {
 		FreelListAllocated: s.FreelListAllocated.Load(),
 		SyncPoolAllocated:  s.SyncPoolAllocated.Load(),
 		NewAlloc:           s.NewAlloc.Load(),
+		SyncPoolMiss:       s.SyncPoolMiss.Load(),
 	}
 	stats.TotalAllocated = stats.FreelListAllocated + stats.SyncPoolAllocated + stats.NewAlloc
 	return stats
@@ -309,9 +318,14 @@ type Stats struct {
 
 	// FreelListAllocated is how many allocations have come from the freelist.
 	// SyncPoolAllocated is how many allocations came from the sync.Pool.
-	// NewAlloc is how many allocation were new allocations by the allocator.
+	// NewAlloc is how many allocation were new allocations by the allocator, including
+	// sync.Pool.New() calls.
 	// TotalAllocated is the total amount of allocations by the Pool.
 	FreelListAllocated, SyncPoolAllocated, NewAlloc, TotalAllocated uint64
+
+	// SyncPoolMiss is how many times the internal sync.Pool had to allocate
+	// becasue it didn't have any pool values to use.
+	SyncPoolMiss uint64
 
 	// Dropped is how many values were dropped by the Pool. This is only valid
 	// when using this as a freelist only. We don't have visibility into the

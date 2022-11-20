@@ -3,18 +3,22 @@ Package ptrpool provides a combination freelist and sync.Pool for storing
 pointers to types. The Pool can be set to either of these or a combination of
 both that has the strength of both.
 
+In addition, a growth function can be provided to allow the freelist to grow
+and shrink as needed at intervals.
+
 It also provides a Pool.Stats() method to allow introspecting the Pool to determine
 Pool behavior.
 
 If the type to be stored is *[]byte or *bytes.Buffer, you should use
-github.com/johnsiilver/pools/memory/buffers/diffsize instead.
+github.com/johnsiilver/pools/memory/buffers/diffsize instead. It has better
+handling of these special types.
 
 Here are some examples of different Pool configurations:
 
 Example: Freelist only
 
 	pool, err := New[Record](
-		100,
+		FreeList{Base: 100},
 		func() *Record {
 			return &Record{}
 		},
@@ -48,10 +52,10 @@ Example: Freelist only
 		v.Close()
 	}
 
-Example: Freelist with no allocations beyond freelist
+Example: Freelist with no allocations beyond freelist, aka it blocks.
 
 	pool, err := New[Record](
-		100,
+		FreeList{Base: 100, DisableAllocs: true},
 		func() *Record {
 			return &Record{}
 		},
@@ -61,7 +65,6 @@ Example: Freelist with no allocations beyond freelist
 			},
 		),
 		DisableSyncPool(),
-		DisableAllocs(),
 	)
 	if err != nil {
 		// Do something
@@ -73,7 +76,27 @@ Example: Freelist with no allocations beyond freelist
 Example: Freelist with sync.Pool for backup
 
 	pool, err := New[Record](
-		10,
+		FreeList{Base: 10},
+		func() *Record {
+			return &Record{}
+		},
+		ResetValue(
+			func(r *Record) {
+				r.Reset()
+			},
+		),
+
+	if err != nil {
+		// Do something
+	}
+	defer p.pool.Close()
+
+	... // The rest is the same
+
+Example: Freelist with sync.Pool and growth function, no maximum list size
+
+	pool, err := New[Record](
+		FreeList{Base: 10: Grower: BasicGrower},
 		func() *Record {
 			return &Record{}
 		},
@@ -94,7 +117,11 @@ package ptrpool
 
 import (
 	"fmt"
+	"log"
+	"reflect"
+	"runtime"
 	"sync"
+	"time"
 
 	"sync/atomic"
 )
@@ -122,14 +149,144 @@ type ResetValue[A any] func(*A)
 // Pool provides a pool of reusable values that can come from a freelist or
 // a sync.Pool or combinations of both.
 type Pool[A any] struct {
-	static chan *A
-	pool   *sync.Pool
+	freelist atomic.Pointer[chan *A]
+	pool     *sync.Pool
 
-	newer  NewValue[A]
-	reset  ResetValue[A]
-	allocs bool
+	freelistSettings FreeList
+	newer            NewValue[A]
+	reset            ResetValue[A]
 
 	stats *stats
+
+	close chan struct{}
+}
+
+// FreeList are arguements for the freelist. A zero value here disables the
+// freelist.
+type FreeList struct {
+	// Base is the base amount of values in the freelist. This is the
+	// minimum that the freelist will hold. This must be >= 0.
+	// a FreeList can only have 0 as a Base if the FreeList is the zero value,
+	// Grow is set, or the Pool does not have DisableSyncPool.
+	Base int
+
+	// DisableAllocs disables allocations when a freelist does not have
+	// enough capacity. This cannot be used if the option DisableSyncPool()
+	// is not provided to New(). Using this also prevents Grow from being set.
+	// CAUTION: Using this requires always calling Value.Close() on any value
+	// checked out of the Pool. Otherwise you will reach Pool exhaustion and
+	// the Pool will block on new Get() calls indefinetly.
+	DisableAllocs bool
+
+	// Grow provides settings for growing your freelist. A zero value here
+	// diables growth.
+	Grow Grow
+}
+
+func (f FreeList) validate(haveSyncPool bool) error {
+	if reflect.ValueOf(f).IsZero() {
+		return nil
+	}
+
+	zeroGrow := reflect.ValueOf(f.Grow).IsZero()
+
+	if f.DisableAllocs && !zeroGrow {
+		return fmt.Errorf("cannot have FreeList.DisableAllocs(true) and FreeList.Grow set")
+	}
+
+	if f.DisableAllocs && haveSyncPool {
+		return fmt.Errorf("cannot have FreeList.DisableAllocs(true) and not DisableSyncPool()")
+	}
+
+	if f.Base < 0 {
+		return fmt.Errorf("FreeList.Base cannot be < 0")
+	}
+
+	if f.Base == 0 && zeroGrow && !haveSyncPool {
+		return fmt.Errorf("FreeList.Base == 0 && f.Grow == nil && DisableSyncPool() set, this is invalid")
+	}
+
+	return f.Grow.validate()
+}
+
+// GrowthArgs are arguments to a growth function to decide if the freelist
+// should grow, shrink or stay the same.
+type GrowthArgs struct {
+	// CurrentSize is the current size of the freelist.
+	CurrentSize int
+	// PoolPulls is how many times we pulled from the sync.Pool during the
+	// MeasurementSpan.
+	PoolPulls int
+	// MeasurementSpan is the timespan these measurements occurred in.
+	MeasurementSpan time.Duration
+}
+
+// Grow are instructions on how to Grow your freelist. Growing your freelist
+// is generally a good idea when you have some amount of sustained use. This
+// allows you to ramp up until you almost never allocate and values lasts past
+// GC cycles (unlike a sync.Pool). Small lulls won't reclaim use. This comes
+// at the cost of holding memory for longer periods of time.
+type Grow struct {
+	// Maximum indicates the maximum size the freelist can grow.
+	// <= 0 indicates the freelist can grow to any size.
+	Maximum int
+
+	// MeasurementSpan is how long we should measure before checking the
+	// trigger for growth. This must be > 1 second.
+	MeasurementSpan time.Duration
+
+	// Grower is a function that determines the new capacity of the freelist.
+	// It receives the current size of the freelist and how many
+	// items in the MeasurementSpan were allocated outside the freelist.
+	// This must return a positive value.
+	Grower func(args GrowthArgs) int
+}
+
+func (g Grow) validate() error {
+	if reflect.ValueOf(g).IsZero() {
+		return nil
+	}
+
+	if g.MeasurementSpan < 1*time.Second {
+		return fmt.Errorf("FreeList.Grow.MeasurementSpan can not be set to < 1 second")
+	}
+
+	if g.Grower == nil {
+		return fmt.Errorf("FreeList.Grow.Grower cannot be nil")
+	}
+	return nil
+}
+
+// BasicGrower provides a simple growth function that grows and shrinks the
+// freelist.. It will grow the freelist
+// by the average number of values that were missed per second. It will shrink
+// by 10% whenever there have been no misses for 4 consecutive periods.
+// Recommend if using this a 30 second MeasurementSpan.
+type BasicGrower struct {
+	noGrowth int
+}
+
+// Grower implements Growth.Grower.
+func (b *BasicGrower) Grower(args GrowthArgs) int {
+	secs := args.MeasurementSpan / time.Second
+	if secs == 0 { // Protection from divide by 0.
+		return args.CurrentSize
+	}
+	if args.PoolPulls > 0 {
+		overagePerSec := args.PoolPulls / int(secs)
+		if overagePerSec > 0 { // Growth
+			return args.CurrentSize + overagePerSec
+		}
+		return args.CurrentSize // Not enough to trigger growth.
+	}
+
+	b.noGrowth++
+	if b.noGrowth >= 4 {
+		shrinkBy := float64(args.CurrentSize) * .10
+		b.noGrowth = 0
+		return args.CurrentSize - int(shrinkBy)
+	}
+	return args.CurrentSize
 }
 
 // Option is an option to the New() constructor.
@@ -140,17 +297,6 @@ type Option[A any] func(p *Pool[A])
 func DisableSyncPool[A any]() func(p *Pool[A]) {
 	return func(p *Pool[A]) {
 		p.pool = nil
-	}
-}
-
-// DisableAllocs prevents any allocations if the Pool is empty. This can
-// only be used with DisableSyncPool() and an existing static buffer.
-// CAUTION: Using this requires always calling Value.Close() on any value
-// checked out of the Pool. Otherwise you will reach Pool exhaustion and
-// the Pool will block on new Get() calls indefinetly.
-func DisableAllocs[A any]() func(p *Pool[A]) {
-	return func(p *Pool[A]) {
-		p.allocs = false
 	}
 }
 
@@ -165,16 +311,17 @@ func Reseter[A any](reset ResetValue[A]) func(p *Pool[A]) {
 // New creates a new Pool of Values. freelist is how large your static buffer is.
 // freelist values never get garbage collected. newer is the function that creates
 // new values for use in the Pool when an allocation is required.
-func New[A any](freelist int, newer NewValue[A], options ...Option[A]) (*Pool[A], error) {
+func New[A any](freelist FreeList, newer NewValue[A], options ...Option[A]) (*Pool[A], error) {
 	if newer == nil {
 		return nil, fmt.Errorf("newer cannot be nil")
 	}
 
 	p := &Pool[A]{
-		pool:   &sync.Pool{},
-		newer:  newer,
-		allocs: true,
-		stats:  &stats{},
+		pool:             &sync.Pool{},
+		newer:            newer,
+		freelistSettings: freelist,
+		stats:            &stats{},
+		close:            make(chan struct{}),
 	}
 
 	syncNewWrap := func() any {
@@ -185,28 +332,32 @@ func New[A any](freelist int, newer NewValue[A], options ...Option[A]) (*Pool[A]
 	}
 	p.pool.New = syncNewWrap
 
-	if freelist > 0 {
-		staticBuff := make(chan *A, freelist)
-		p.static = staticBuff
+	if freelist.Base > 0 {
+		fl := make(chan *A, freelist.Base)
+		p.freelist.Store(&fl)
 	}
 
 	for _, o := range options {
 		o(p)
 	}
 
-	if freelist == 0 && p.pool == nil {
-		return nil, fmt.Errorf("cannot have a Pool with no static buffer and disabled sync.Pool")
-	}
-	if !p.allocs && p.pool != nil {
-		return nil, fmt.Errorf("cannot have a Pool with no allocations allowed and a non-disabled sync.Pool")
+	if err := freelist.validate(p.pool != nil); err != nil {
+		return nil, err
 	}
 
 	// If we cannot allocate, then we need to fill the static buffer before any
 	// uses instead of doing lazy buffer init.
-	if !p.allocs {
-		for i := 0; i < len(p.static); i++ {
-			p.put(Value[A]{V: p.newer(), pool: p})
+	if freelist.DisableAllocs {
+		fl := p.freelist.Load()
+		for i := 0; i < cap(*fl); i++ {
+			v := p.newer()
+			*fl <- v
 		}
+		p.freelist.Store(fl)
+	}
+
+	if !reflect.ValueOf(freelist.Grow).IsZero() {
+		go p.grower()
 	}
 
 	return p, nil
@@ -214,17 +365,16 @@ func New[A any](freelist int, newer NewValue[A], options ...Option[A]) (*Pool[A]
 
 // Close closes the Pool.
 func (p *Pool[A]) Close() {
-	// At this time, we don't need to do anything.
-	// This future proofs us if we decide to make some changes that requires
-	// a Close() function.
+	close(p.close)
 }
 
 // Get retrieves a Value from the Pool.
 func (p *Pool[A]) Get() Value[A] {
+	fl := p.freelist.Load()
 	switch {
-	case p.static != nil && p.pool != nil:
+	case fl != nil && p.pool != nil:
 		select {
-		case x := <-p.static:
+		case x := <-*fl:
 			p.stats.InUse.Add(1)
 			p.stats.FreelListAllocated.Add(1)
 			return Value[A]{V: x, pool: p}
@@ -233,10 +383,10 @@ func (p *Pool[A]) Get() Value[A] {
 			p.stats.SyncPoolAllocated.Add(1)
 			return Value[A]{V: p.pool.Get().(*A), pool: p}
 		}
-	case p.static != nil && p.pool == nil:
-		if p.allocs {
+	case fl != nil && p.pool == nil:
+		if !p.freelistSettings.DisableAllocs {
 			select {
-			case x := <-p.static:
+			case x := <-*fl:
 				p.stats.InUse.Add(1)
 				p.stats.FreelListAllocated.Add(1)
 				return Value[A]{V: x, pool: p}
@@ -247,17 +397,27 @@ func (p *Pool[A]) Get() Value[A] {
 			}
 		}
 		// Since we don't allow allocating when the freelist is empty,
-		// we are going to wait here indefinitely.
-		x := <-p.static
-		p.stats.InUse.Add(1)
-		p.stats.FreelListAllocated.Add(1)
-		return Value[A]{V: x, pool: p}
-	case p.static == nil:
+		// we are going to wait here until we receive a value.
+		t := time.NewTicker(100 * time.Nanosecond)
+	repeat:
+		select {
+		case x := <-*fl:
+			t.Stop()
+			p.stats.InUse.Add(1)
+			p.stats.FreelListAllocated.Add(1)
+			return Value[A]{V: x, pool: p}
+		case <-t.C:
+			fl = p.freelist.Load()
+			runtime.Gosched()
+			t.Reset(100 * time.Nanosecond)
+			goto repeat
+		}
+	case *fl == nil:
 		p.stats.InUse.Add(1)
 		p.stats.SyncPoolAllocated.Add(1)
 		return Value[A]{V: p.pool.Get().(*A), pool: p}
 	default:
-		panic(fmt.Sprintf("unknown Pool condition: p.static(%v), p.pool(%v", p.static != nil, p.pool != nil))
+		panic(fmt.Sprintf("unknown Pool condition: p.static(%v), p.pool(%v", p.freelist.Load() != nil, p.pool != nil))
 	}
 }
 
@@ -270,18 +430,74 @@ func (p *Pool[A]) put(v Value[A]) {
 	p.stats.InUse.Add(-1)
 
 	if p.pool != nil {
+		fl := p.freelist.Load()
 		select {
-		case p.static <- v.V:
+		case *fl <- v.V:
 			return
 		default:
 			p.pool.Put(v.V)
 		}
 		return
 	}
+	fl := p.freelist.Load()
 	select {
-	case p.static <- v.V:
+	case *fl <- v.V:
 	default:
 		// Drop the buffer.
+	}
+}
+
+// grower handles all the growing and shrinking that might need to occur.
+func (p *Pool[A]) grower() {
+	lastStats := p.stats.toStats()
+
+	ticker := time.NewTicker(p.freelistSettings.Grow.MeasurementSpan)
+	for {
+		select {
+		case <-ticker.C:
+		case <-p.close:
+			return
+		}
+		stats := p.stats.toStats()
+		l := len(*p.freelist.Load())
+		allocated := stats.SyncPoolAllocated - lastStats.SyncPoolAllocated
+		v := p.freelistSettings.Grow.Grower(
+			GrowthArgs{
+				CurrentSize:     l,
+				PoolPulls:       int(allocated),
+				MeasurementSpan: p.freelistSettings.Grow.MeasurementSpan,
+			},
+		)
+		lastStats = stats
+		switch {
+		case v == l:
+			continue
+		case v <= 0:
+			log.Println("ignoring a pool freelist size of <= 0")
+			continue
+		case p.freelistSettings.Grow.Maximum <= 0:
+			// Do nothing we have no growth limit.
+		case v > p.freelistSettings.Grow.Maximum:
+			v = p.freelistSettings.Grow.Maximum
+			if v == l {
+				continue
+			}
+		}
+		if v < p.freelistSettings.Base {
+			v = p.freelistSettings.Base
+		}
+
+		n := make(chan *A, v)
+		old := p.freelist.Swap(&n)
+		close(*old)
+		for e := range *old {
+			select {
+			case n <- e:
+				continue
+			default:
+			}
+			break
+		}
 	}
 }
 

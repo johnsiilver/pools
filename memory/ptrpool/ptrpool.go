@@ -73,7 +73,7 @@ Example: Freelist with no allocations beyond freelist, aka it blocks if freelist
 
 	... // The rest is the same
 
-Example: Freelist with sync.Pool for backup
+Example: Freelist with sync.Pool for backup when freelist is empty
 
 	pool, err := New[Record](
 		FreeList{Base: 10},

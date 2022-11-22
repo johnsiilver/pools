@@ -52,7 +52,7 @@ Example: Freelist only
 		v.Close()
 	}
 
-Example: Freelist with no allocations beyond freelist, aka it blocks.
+Example: Freelist with no allocations beyond freelist, aka it blocks if freelist is empty.
 
 	pool, err := New[Record](
 		FreeList{Base: 100, DisableAllocs: true},
@@ -136,11 +136,13 @@ type Value[A any] struct {
 
 // Close puts Value.V into the Pool it came from. This Value should not be used again.
 func (v Value[A]) Close() {
-	v.pool.put(v)
+	if v.pool != nil {
+		v.pool.put(v)
+	}
 }
 
 // NewValue is a function that returns a new value that can be used in a Value
-// returned by a Pool when the Pool is empty.
+// returned by a Pool when the Pool is empty. The returned value must not be nil.
 type NewValue[A any] func() *A
 
 // ResetValue resets a value before the value is reinserted into the pool.
@@ -159,6 +161,10 @@ type Pool[A any] struct {
 	stats *stats
 
 	close chan struct{}
+
+	// lastStats is used in grower() as the last stats collected during
+	// a loop.
+	lastStats Stats
 }
 
 // FreeList are arguements for the freelist. A zero value here disables the
@@ -206,6 +212,14 @@ func (f FreeList) validate(haveSyncPool bool) error {
 		return fmt.Errorf("FreeList.Base == 0 && f.Grow == nil && DisableSyncPool() set, this is invalid")
 	}
 
+	if !zeroGrow {
+		if f.Grow.Maximum > 0 {
+			if f.Base <= f.Grow.Maximum {
+				return fmt.Errorf("FreeList.Base cannot be <= FreeList.Grow.Maximum")
+			}
+		}
+	}
+
 	return f.Grow.validate()
 }
 
@@ -223,7 +237,7 @@ type GrowthArgs struct {
 
 // Grow are instructions on how to Grow your freelist. Growing your freelist
 // is generally a good idea when you have some amount of sustained use. This
-// allows you to ramp up until you almost never allocate and values lasts past
+// allows you to ramp up until you almost never allocate and values last past
 // GC cycles (unlike a sync.Pool). Small lulls won't reclaim use. This comes
 // at the cost of holding memory for longer periods of time.
 type Grow struct {
@@ -232,13 +246,15 @@ type Grow struct {
 	Maximum int
 
 	// MeasurementSpan is how long we should measure before checking the
-	// trigger for growth. This must be > 1 second.
+	// trigger for growth. This must be > 1 second, but generally should be
+	// a timespan > 30 seconds.
 	MeasurementSpan time.Duration
 
 	// Grower is a function that determines the new capacity of the freelist.
 	// It receives the current size of the freelist and how many
 	// items in the MeasurementSpan were allocated outside the freelist.
-	// This must return a positive value.
+	// This must return a positive value and will be the new capacity of
+	// the freelist.
 	Grower func(args GrowthArgs) int
 }
 
@@ -261,7 +277,7 @@ func (g Grow) validate() error {
 // freelist.. It will grow the freelist
 // by the average number of values that were missed per second. It will shrink
 // by 10% whenever there have been no misses for 4 consecutive periods.
-// Recommend if using this a 30 second MeasurementSpan.
+// Recommend using this with a 30 second MeasurementSpan or longer.
 type BasicGrower struct {
 	noGrowth int
 }
@@ -407,6 +423,9 @@ func (p *Pool[A]) Get() Value[A] {
 			p.stats.FreelListAllocated.Add(1)
 			return Value[A]{V: x, pool: p}
 		case <-t.C:
+			// We reload our freelist because it is possible that we've grown
+			// and the freelist we were looking at has been drained, hence
+			// the whole Ticker repeat loop here.
 			fl = p.freelist.Load()
 			runtime.Gosched()
 			t.Reset(100 * time.Nanosecond)
@@ -429,6 +448,7 @@ func (p *Pool[A]) put(v Value[A]) {
 	}
 	p.stats.InUse.Add(-1)
 
+	// We have a sync.Pool, so if the freelist is full we can put in the pool.
 	if p.pool != nil {
 		fl := p.freelist.Load()
 		select {
@@ -439,6 +459,8 @@ func (p *Pool[A]) put(v Value[A]) {
 		}
 		return
 	}
+	// We don't have a sync.Pool, so if the freelist is full we must drop
+	// the value.
 	fl := p.freelist.Load()
 	select {
 	case *fl <- v.V:
@@ -449,55 +471,63 @@ func (p *Pool[A]) put(v Value[A]) {
 
 // grower handles all the growing and shrinking that might need to occur.
 func (p *Pool[A]) grower() {
-	lastStats := p.stats.toStats()
-
 	ticker := time.NewTicker(p.freelistSettings.Grow.MeasurementSpan)
 	for {
 		select {
 		case <-ticker.C:
+			p.growth()
 		case <-p.close:
 			return
 		}
-		stats := p.stats.toStats()
-		l := len(*p.freelist.Load())
-		allocated := stats.SyncPoolAllocated - lastStats.SyncPoolAllocated
-		v := p.freelistSettings.Grow.Grower(
-			GrowthArgs{
-				CurrentSize:     l,
-				PoolPulls:       int(allocated),
-				MeasurementSpan: p.freelistSettings.Grow.MeasurementSpan,
-			},
-		)
-		lastStats = stats
-		switch {
-		case v == l:
-			continue
-		case v <= 0:
-			log.Println("ignoring a pool freelist size of <= 0")
-			continue
-		case p.freelistSettings.Grow.Maximum <= 0:
-			// Do nothing we have no growth limit.
-		case v > p.freelistSettings.Grow.Maximum:
-			v = p.freelistSettings.Grow.Maximum
-			if v == l {
-				continue
-			}
-		}
-		if v < p.freelistSettings.Base {
-			v = p.freelistSettings.Base
-		}
+	}
+}
 
-		n := make(chan *A, v)
-		old := p.freelist.Swap(&n)
-		close(*old)
-		for e := range *old {
+func (p *Pool[A]) growth() {
+	stats := p.stats.toStats()
+	l := cap(*p.freelist.Load())
+	allocated := stats.SyncPoolAllocated - p.lastStats.SyncPoolAllocated
+	v := p.freelistSettings.Grow.Grower(
+		GrowthArgs{
+			CurrentSize:     l,
+			PoolPulls:       int(allocated),
+			MeasurementSpan: p.freelistSettings.Grow.MeasurementSpan,
+		},
+	)
+	p.lastStats = stats
+
+	switch {
+	case v == l:
+		return
+	case v <= 0:
+		log.Println("ignoring a pool freelist size of <= 0")
+		return
+	case p.freelistSettings.Grow.Maximum <= 0:
+		// Do nothing we have no growth limit.
+	case v > p.freelistSettings.Grow.Maximum:
+		v = p.freelistSettings.Grow.Maximum
+		if v == l {
+			return
+		}
+	}
+	if v < p.freelistSettings.Base {
+		v = p.freelistSettings.Base
+	}
+
+	n := make(chan *A, v)
+	old := p.freelist.Swap(&n)
+	for {
+		select {
+		case e := <-*old:
 			select {
 			case n <- e:
 				continue
 			default:
+				// No more room.
 			}
-			break
+		default:
+			// Nothing left in the old channel.
 		}
+		break
 	}
 }
 
@@ -536,7 +566,7 @@ type Stats struct {
 	// SyncPoolAllocated is how many allocations came from the sync.Pool.
 	// NewAlloc is how many allocation were new allocations by the allocator, including
 	// sync.Pool.New() calls.
-	// TotalAllocated is the total amount of allocations by the Pool.
+	// TotalAllocated is the total amount of allocations by the Pool (not sync.Pool).
 	FreelListAllocated, SyncPoolAllocated, NewAlloc, TotalAllocated uint64
 
 	// SyncPoolMiss is how many times the internal sync.Pool had to allocate

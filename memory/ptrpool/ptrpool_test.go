@@ -40,6 +40,99 @@ func TestFreeListOnly(t *testing.T) {
 	wg.Wait()
 }
 
+func TestGrowth(t *testing.T) {
+	tests := []struct {
+		desc             string
+		lastStats        Stats
+		currentStats     *stats
+		currentFreelist  chan *int
+		freelistSettings FreeList
+		wantSize         int
+	}{
+		{
+			desc:            "Grower says to Keep same size",
+			currentStats:    &stats{},
+			currentFreelist: make(chan *int, 10),
+			freelistSettings: FreeList{
+				Base: 2,
+				Grow: Grow{
+					Maximum:         100,
+					MeasurementSpan: 30 * time.Second,
+					Grower: func(args GrowthArgs) int {
+						return args.CurrentSize
+					},
+				},
+			},
+			wantSize: 10,
+		},
+		{
+			desc:            "Bad grower gives <= 0 answer, keep same size",
+			currentStats:    &stats{},
+			currentFreelist: make(chan *int, 10),
+			freelistSettings: FreeList{
+				Base: 2,
+				Grow: Grow{
+					Maximum:         100,
+					MeasurementSpan: 30 * time.Second,
+					Grower: func(args GrowthArgs) int {
+						return -1
+					},
+				},
+			},
+			wantSize: 10,
+		},
+		{
+			desc:            "Says to grow bigger than maximum, so grow maximum",
+			currentStats:    &stats{},
+			currentFreelist: make(chan *int, 10),
+			freelistSettings: FreeList{
+				Base: 2,
+				Grow: Grow{
+					Maximum:         100,
+					MeasurementSpan: 30 * time.Second,
+					Grower: func(args GrowthArgs) int {
+						return 101
+					},
+				},
+			},
+			wantSize: 100,
+		},
+		{
+			desc:            "Shrink less than base, so go to base size",
+			currentStats:    &stats{},
+			currentFreelist: make(chan *int, 10),
+			freelistSettings: FreeList{
+				Base: 2,
+				Grow: Grow{
+					Maximum:         100,
+					MeasurementSpan: 30 * time.Second,
+					Grower: func(args GrowthArgs) int {
+						return 1
+					},
+				},
+			},
+			wantSize: 2,
+		},
+	}
+
+	for _, test := range tests {
+		p := &Pool[int]{
+			freelistSettings: test.freelistSettings,
+			stats:            test.currentStats,
+			lastStats:        test.lastStats,
+		}
+
+		p.freelist.Store(&test.currentFreelist)
+
+		p.growth()
+
+		fl := p.freelist.Load()
+		if cap(*fl) != test.wantSize {
+			t.Errorf("TestGrowth(%s): got FreeList size %d, want %d", test.desc, cap(*fl), test.wantSize)
+		}
+	}
+}
+
 func TestBGGrowth(t *testing.T) {
 	tests := []struct {
 		desc     string

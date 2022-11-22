@@ -1,10 +1,10 @@
 /*
 Package ptrpool provides a combination freelist and sync.Pool for storing
 pointers to types. The Pool can be set to either of these or a combination of
-both that has the strength of both.
+both.
 
 In addition, a growth function can be provided to allow the freelist to grow
-and shrink as needed at intervals.
+and shrink as needed.
 
 It also provides a Pool.Stats() method to allow introspecting the Pool to determine
 Pool behavior.
@@ -22,7 +22,7 @@ Example: Freelist only
 		func() *Record {
 			return &Record{}
 		},
-		ResetValue(
+		Reseter(
 			func(r *Record) {
 				r.Reset()
 			},
@@ -34,21 +34,21 @@ Example: Freelist only
 	}
 	defer p.pool.Close()
 
-	ch := make(chan Value[*Record], 1000)
+	ch := make(chan Value[Record], 1000)
 
 	// Get a *Record from the pool, set the ID and send it for printing.
 	go func() {
 		defer close(ch)
 		for i := 0; i < 100000; i++ {
 			v := pool.Get()
-			v.V.Id = i
+			v.V.ID = i
 			ch <- v
 		}
 	}()
 
 	// Print all values received and send it back to the freelist.
 	for v := range ch {
-		fmt.Println("Record ID: %d", v.V.Id)
+		fmt.Println("Record ID: %d", v.V.ID)
 		v.Close()
 	}
 
@@ -59,12 +59,12 @@ Example: Freelist with no allocations beyond freelist, aka it blocks if freelist
 		func() *Record {
 			return &Record{}
 		},
-		ResetValue(
+		Reseter(
 			func(r *Record) {
 				r.Reset()
 			},
 		),
-		DisableSyncPool(),
+		DisableSyncPool[Record](),
 	)
 	if err != nil {
 		// Do something
@@ -80,7 +80,7 @@ Example: Freelist with sync.Pool for backup when freelist is empty
 		func() *Record {
 			return &Record{}
 		},
-		ResetValue(
+		Reseter(
 			func(r *Record) {
 				r.Reset()
 			},
@@ -96,11 +96,18 @@ Example: Freelist with sync.Pool for backup when freelist is empty
 Example: Freelist with sync.Pool and growth function, no maximum list size
 
 	pool, err := New[Record](
-		FreeList{Base: 10: Grower: BasicGrower},
+		FreeList{
+			Base: 1,
+			Grow: Grow{
+				Maximum:         1000,
+				MeasurementSpan: 1 * time.Second,
+				Grower:          (&BasicGrower{}).Grower,
+			},
+		},
 		func() *Record {
 			return &Record{}
 		},
-		ResetValue(
+		Reseter(
 			func(r *Record) {
 				r.Reset()
 			},
@@ -214,8 +221,8 @@ func (f FreeList) validate(haveSyncPool bool) error {
 
 	if !zeroGrow {
 		if f.Grow.Maximum > 0 {
-			if f.Base <= f.Grow.Maximum {
-				return fmt.Errorf("FreeList.Base cannot be <= FreeList.Grow.Maximum")
+			if f.Base >= f.Grow.Maximum {
+				return fmt.Errorf("FreeList.Base cannot be >= FreeList.Grow.Maximum")
 			}
 		}
 	}

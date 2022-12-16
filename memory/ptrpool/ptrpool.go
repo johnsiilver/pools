@@ -447,6 +447,12 @@ func (p *Pool[A]) Get() Value[A] {
 	}
 }
 
+// Put puts the naked value into the Pool. This is useful when the value that is being used is part of a composite type
+// (like a field in a struct) that makes it inconvenient to use Value.Close().
+func (p *Pool[A]) Put(a *A) {
+	p.put(Value[A]{V: a})
+}
+
 // put puts the value held by Value in our freelist or sync.Pool or drops it if
 // neither have space.
 func (p *Pool[A]) put(v Value[A]) {
